@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Clear Speak — Prototipo</title>
+
+  <!-- Tailwind CDN (ideal para prototipos) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Simple reset + font -->
+  <style>
+    html,body,#root { height: 100%; }
+    body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- React + ReactDOM (UMD) -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+  <!-- Babel para transformar JSX en el navegador (solo prototipo) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- App: JSX -->
+  <script type="text/babel">
+  // Clear Speak - Prototipo (versión HTML/JSX para navegador)
+  const { useEffect, useMemo, useRef, useState } = React;
+
+  // --------- Utilidades de almacenamiento local ---------
+  const storage = {
+    get(key, fallback) {
+      try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
+    },
+    set(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} },
+    del(key) { try { localStorage.removeItem(key); } catch {} }
+  };
+
+  function uid() { return Math.random().toString(36).slice(2, 10); }
+
+  // Texto a voz (TTS)
+  function speak(text, { rate = 0.95, pitch = 1, voice = null } = {}) {
+    if (!("speechSynthesis" in window)) return alert("Tu navegador no soporta Texto a Voz.");
+    const u = new SpeechSynthesisUtterance(text);
+    const voices = window.speechSynthesis.getVoices();
+    const esVoices = voices.filter(v => v.lang?.startsWith("es"));
+    u.voice = voice || esVoices[0] || voices[0] || null;
+    u.rate = rate; u.pitch = pitch;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+  }
+
+  // Hook de reconocimiento de voz (STT)
+  function useSpeechRecognition({ lang = "es-ES" } = {}) {
+    const [supported, setSupported] = useState(false);
+    const [listening, setListening] = useState(false);
+    const [result, setResult] = useState("");
+    const recRef = useRef(null);
+
+    useEffect(() => {
+      const R = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!R) return; setSupported(true);
+      recRef.current = new R();
+      recRef.current.lang = lang;
+      recRef.current.interimResults = false;
+      recRef.current.maxAlternatives = 1;
+      recRef.current.onresult = (e) => {
+        const t = e.results[0][0].transcript;
+        setResult(t);
+        setListening(false);
+      };
+      recRef.current.onerror = () => setListening(false);
+      recRef.current.onend = () => setListening(false);
+    }, [lang]);
+
+    const start = () => { if (!recRef.current) return; setResult(""); setListening(true); try { recRef.current.start(); } catch(e) { setListening(false); } };
+    const stop = () => { if (!recRef.current) return; recRef.current.stop(); setListening(false); };
+    return { supported, listening, result, start, stop, setResult };
+  }
+
+  // Levenshtein simple para similitud
+  function levenshtein(a = "", b = "") {
+    a = a.toLowerCase().trim(); b = b.toLowerCase().trim();
+    const m = Array.from({ length: a.length + 1 }, () => Array(b.length + 1).fill(0));
+    for (let i = 0; i <= a.length; i++) m[i][0] = i;
+    for (let j = 0; j <= b.length; j++) m[0][j] = j;
+    for (let i = 1; i <= a.length; i++) {
+      for (let j = 1; j <= b.length; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        m[i][j] = Math.min(m[i - 1][j] + 1, m[i][j - 1] + 1, m[i - 1][j - 1] + cost);
+      }
+    }
+    return m[a.length][b.length];
+  }
+
+  function similarity(a, b) {
+    if (!a && !b) return 1;
+    const d = levenshtein(a, b);
+    const maxLen = Math.max(a.length, b.length) || 1;
+    return Math.max(0, 1 - d / maxLen);
+  }
+
+  // Heurística simple separación de sílabas (no perfecta)
+  function splitSyllables(word) {
+    const vowels = "aeiouáéíóúü";
+    const chars = word.toLowerCase().split("");
+    const chunks = [];
+    let chunk = "";
+    for (let i = 0; i < chars.length; i++) {
+      chunk += chars[i];
+      const currV = vowels.includes(chars[i]);
+      const nextV = vowels.includes(chars[i + 1] || "");
+      if (currV && !nextV) { chunks.push(chunk); chunk = ""; }
+    }
+    if (chunk) chunks.push(chunk);
+    return chunks.filter(Boolean);
+  }
+
+  // --------- Datos (ejemplo) ---------
+  const WORDS = [
+    "casa","camisa","pelota","mariposa","escritorio","computadora","historia",
+    "sol","luna","pájaro","ventana","libro","familia","escuela","amigo","azúcar"
+  ];
+  const FRASES = [
+    "La casa es de color azul.",
+    "Mi mamá cocina sopa caliente.",
+    "El perro corre en el parque.",
+    "Hoy practico la lectura con calma."
+  ];
+  const PARES_MINIMOS = [
+    ["pero","perro"], ["casa","caza"], ["taza","caza"], ["baca","vaca"], ["giro","jiro"]
+  ];
+
+  // --------- Componentes UI pequeños ---------
+  function Card({ title, children, actions }) {
+    return (
+      <div className="bg-white/80 dark:bg-neutral-900/80 backdrop-blur p-4 rounded-2xl shadow-md border border-neutral-200 dark:border-neutral-800">
+        <div className="flex items-start justify-between mb-2">
+          <h3 className="text-lg font-semibold tracking-tight">{title}</h3>
+          <div className="flex gap-2">{actions}</div>
+        </div>
+        <div>{children}</div>
+      </div>
+    );
+  }
+
+  function Toggle({ checked, onChange, label }) {
+    return (
+      <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+        <input type="checkbox" className="sr-only" checked={checked} onChange={e => onChange?.(e.target.checked)} />
+        <span className={`w-12 h-7 rounded-full transition-all ${checked ? "bg-blue-600" : "bg-neutral-300"} relative`}>
+          <span className={`absolute top-1 left-1 w-5 h-5 rounded-full bg-white transition-all ${checked ? "translate-x-5" : "translate-x-0"}`}></span>
+        </span>
+        <span className="text-sm">{label}</span>
+      </label>
+    );
+  }
+
+  function Button({ children, onClick, type = "button", className = "" }) {
+    return (
+      <button type={type} onClick={onClick} className={`px-4 py-2 rounded-2xl shadow-sm border border-neutral-200 dark:border-neutral-700 hover:shadow transition text-sm ${className}`}>
+        {children}
+      </button>
+    );
+  }
+
+  function Stat({ label, value }) {
+    return (
+      <div className="p-3 rounded-2xl bg-neutral-100 dark:bg-neutral-800 text-center">
+        <div className="text-2xl font-bold">{value}</div>
+        <div className="text-xs text-neutral-500">{label}</div>
+      </div>
+    );
+  }
+
+  // --------- Pantalla de autenticación (local) ---------
+  function AuthScreen({ onLogin }) {
+    const [mode, setMode] = useState("login");
+    const [form, setForm] = useState({ nombre: "", email: "", pass: "" });
+    const [error, setError] = useState("");
+    const users = useMemo(() => storage.get("cs.users", []), []);
+
+    function handleSubmit(e) {
+      e.preventDefault(); setError("");
+      const { nombre, email, pass } = form;
+      if (!email || !pass) return setError("Completa email y contraseña.");
+      if (mode === "login") {
+        const u = users.find(u => u.email === email && u.pass === pass);
+        if (!u) return setError("Credenciales incorrectas.");
+        storage.set("cs.session", u);
+        onLogin(u);
+      } else {
+        if (!nombre) return setError("Escribe tu nombre.");
+        if (users.some(u => u.email === email)) return setError("Ya existe una cuenta con ese email.");
+        const newU = { id: uid(), nombre, email, pass, progreso: { lectura: 0, pron: 0, escritura: 0, juegos: 0 } };
+        const updated = [...users, newU];
+        storage.set("cs.users", updated);
+        storage.set("cs.session", newU);
+        onLogin(newU);
+      }
+    }
+
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-neutral-900 dark:to-neutral-950 p-6">
+        <div className="w-full max-w-md p-6 bg-white dark:bg-neutral-900 rounded-3xl shadow-xl border border-neutral-200 dark:border-neutral-800">
+          <h1 className="text-2xl font-extrabold text-center mb-2">Clear Speak</h1>
+          <p className="text-center text-neutral-500 mb-6">Aprender a leer, pronunciar y escribir — accesible para dislexia</p>
+
+          <div className="grid grid-cols-2 gap-2 mb-4">
+            <button onClick={() => setMode("login")} className={`p-2 rounded-2xl ${mode === "login" ? "bg-blue-600 text-white" : "bg-neutral-100 dark:bg-neutral-800"}`}>Iniciar sesión</button>
+            <button onClick={() => setMode("register")} className={`p-2 rounded-2xl ${mode === "register" ? "bg-blue-600 text-white" : "bg-neutral-100 dark:bg-neutral-800"}`}>Registrarse</button>
+          </div>
+
+          <form onSubmit={handleSubmit} className="space-y-3">
+            {mode === "register" && (
+              <div>
+                <label className="text-sm">Nombre</label>
+                <input className="w-full p-3 rounded-2xl border bg-neutral-50 dark:bg-neutral-800" value={form.nombre} onChange={e => setForm({ ...form, nombre: e.target.value })} />
+              </div>
+            )}
+            <div>
+              <label className="text-sm">Correo</label>
+              <input type="email" className="w-full p-3 rounded-2xl border bg-neutral-50 dark:bg-neutral-800" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} />
+            </div>
+            <div>
+              <label className="text-sm">Contraseña</label>
+              <input type="password" className="w-full p-3 rounded-2xl border bg-neutral-50 dark:bg-neutral-800" value={form.pass} onChange={e => setForm({ ...form, pass: e.target.value })} />
+            </div>
+            {error && <div className="text-red-600 text-sm">{error}</div>}
+            <button type="submit" className="w-full p-3 rounded-2xl bg-blue-600 text-white">{mode === "login" ? "Entrar" : "Crear cuenta"}</button>
+          </form>
+
+          <p className="text-xs text-neutral-500 mt-6">Al usar este prototipo aceptas guardar tus datos localmente en este dispositivo.</p>
+        </div>
+      </div>
+    );
+  }
+
+  // --------- Módulos principales ---------
+  function Lectura({ onComplete, settings }) {
+    const [index, setIndex] = useState(0);
+    const frase = FRASES[index % FRASES.length];
+
+    return (
+      <Card title="Lectura guiada" actions={
+        <>
+          <Button onClick={() => speak(frase, { rate: settings.vozLenta ? 0.8 : 1 })}>🔊 Escuchar</Button>
+          <Button onClick={() => setIndex(i => i + 1)}>➡️ Siguiente</Button>
+        </>
+      }>
+        <p className={`leading-loose ${settings.grande ? "text-xl" : "text-base"} ${settings.espaciado ? "tracking-wider" : ""}`}>{frase}</p>
+        <p className="text-sm text-neutral-500 mt-2">Consejo: lee en voz alta y marca con el dedo (o cursor) cada palabra.</p>
+        <div className="mt-3">
+          <Button onClick={onComplete} className="bg-green-600 text-white">Marcar como practicado</Button>
+        </div>
+      </Card>
+    );
+  }
+
+  function Pronunciacion({ onComplete, settings }) {
+    const [target, setTarget] = useState(WORDS[0]);
+    const { supported, listening, result, start, stop, setResult } = useSpeechRecognition({ lang: settings.varianteES });
+
+    const score = useMemo(() => Math.round(similarity(target, result) * 100), [target, result]);
+
+    return (
+      <Card title="Pronunciación (repite la palabra)" actions={
+        <>
+          <Button onClick={() => speak(target, { rate: settings.vozLenta ? 0.8 : 1 })}>🔊 Oír palabra</Button>
+          <Button onClick={() => setTarget(WORDS[Math.floor(Math.random()*WORDS.length)])}>🎲 Aleatoria</Button>
+        </>
+      }>
+        <div className="flex flex-col md:flex-row gap-4 items-start md:items-center">
+          <div>
+            <div className={`text-3xl font-extrabold ${settings.espaciado ? "tracking-wider" : ""}`}>{target}</div>
+            <div className="mt-2 text-sm text-neutral-600">Sílabas: {splitSyllables(target).join(" · ")}</div>
+          </div>
+          <div className="flex-1">
+            <div className="text-sm mb-1">Tu pronunciación reconocida:</div>
+            <input value={result} onChange={e => setResult(e.target.value)} className="w-full p-3 rounded-2xl border bg-neutral-50 dark:bg-neutral-800" placeholder="Pulsa grabar y repite…" />
+            <div className="flex gap-2 mt-2">
+              <Button onClick={listening ? stop : start} className={`text-white ${listening ? "bg-red-600" : "bg-blue-600"}`}>{listening ? "■ Detener" : "🎙️ Grabar"}</Button>
+              {!supported && <span className="text-xs text-red-600 self-center">La voz a texto no es compatible en este navegador.</span>}
+              <Button onClick={() => setResult("")}>↺ Limpiar</Button>
+            </div>
+            <div className="mt-3 flex items-center gap-3">
+              <Stat label="Precisión" value={`${isNaN(score) ? 0 : score}%`} />
+              <Button onClick={onComplete} className="bg-green-600 text-white">Guardar práctica</Button>
+            </div>
+          </div>
+        </div>
+      </Card>
+    );
+  }
+
+  function Escritura({ onComplete, settings }) {
+    const [word, setWord] = useState(WORDS[1]);
+    const [input, setInput] = useState("");
+    const correct = useMemo(() => similarity(word, input), [word, input]);
+
+    return (
+      <Card title="Dictado y ortografía" actions={
+        <>
+          <Button onClick={() => speak(word, { rate: settings.vozLenta ? 0.8 : 1 })}>🔊 Dictar</Button>
+          <Button onClick={() => { setWord(WORDS[Math.floor(Math.random()*WORDS.length)]); setInput(""); }}>🎲 Nueva</Button>
+        </>
+      }>
+        <p className="text-sm text-neutral-600">Escucha y escribe la palabra. Observa sílabas y sonidos.</p>
+        <div className="mt-2 text-neutral-700">Pista de sílabas: <span className="font-semibold">{splitSyllables(word).join(" · ")}</span></div>
+        <input value={input} onChange={e => setInput(e.target.value)} className={`w-full p-3 mt-2 rounded-2xl border ${correct > 0.8 ? "border-green-500" : correct > 0.5 ? "border-yellow-500" : "border-neutral-300"} bg-neutral-50 dark:bg-neutral-800`} placeholder="Escribe aquí…" />
+        <div className="mt-3 flex items-center gap-3">
+          <Stat label="Coincidencia" value={`${Math.round(correct*100)}%`} />
+          <Button onClick={onComplete} className="bg-green-600 text-white">Guardar práctica</Button>
+        </div>
+      </Card>
+    );
+  }
+
+  function Juegos({ onComplete }) {
+    const [pair, setPair] = useState(PARES_MINIMOS[0]);
+    const [choice, setChoice] = useState("");
+    const [feedback, setFeedback] = useState("");
+
+    function newRound() {
+      setPair(PARES_MINIMOS[Math.floor(Math.random()*PARES_MINIMOS.length)]);
+      setChoice(""); setFeedback("");
+    }
+
+    return (
+      <Card title="Pares mínimos (discriminación auditiva)">
+        <p className="text-sm text-neutral-600">Escucha con atención y elige la palabra que oyes.</p>
+        <div className="flex gap-2 mt-2">
+          <Button onClick={() => speak(pair[0])}>🔊 Oír 1</Button>
+          <Button onClick={() => speak(pair[1])}>🔊 Oír 2</Button>
+          <Button onClick={newRound}>↺ Nueva ronda</Button>
+        </div>
+        <div className="grid grid-cols-2 gap-2 mt-3">
+          {[pair[0], pair[1]].map(p => (
+            <button key={p} onClick={() => setChoice(p)} className={`p-3 rounded-2xl border ${choice === p ? "bg-blue-600 text-white" : "bg-neutral-50 dark:bg-neutral-800"}`}>{p}</button>
+          ))}
+        </div>
+        <div className="mt-3 flex gap-2">
+          <Button onClick={() => { if (!choice) return setFeedback("Elige una opción."); setFeedback(`Elegiste "${choice}". ¡Bien! Sigue practicando.`); onComplete(); }} className="bg-green-600 text-white">Guardar práctica</Button>
+          {feedback && <div className="self-center text-sm text-neutral-600">{feedback}</div>}
+        </div>
+      </Card>
+    );
+  }
+
+  function Progreso({ user }) {
+    const prog = user?.progreso || { lectura: 0, pron: 0, escritura: 0, juegos: 0 };
+    const total = prog.lectura + prog.pron + prog.escritura + prog.juegos || 0;
+    return (
+      <Card title="Tu progreso">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <Stat label="Lectura" value={prog.lectura} />
+          <Stat label="Pronunciación" value={prog.pron} />
+          <Stat label="Escritura" value={prog.escritura} />
+          <Stat label="Juegos" value={prog.juegos} />
+        </div>
+        <div className="mt-4 text-sm text-neutral-600">Total de prácticas guardadas: <strong>{total}</strong></div>
+      </Card>
+    );
+  }
+
+  function Ajustes({ settings, setSettings, onLogout }) {
+    return (
+      <Card title="Ajustes y accesibilidad">
+        <div className="space-y-3">
+          <Toggle checked={settings.grande} onChange={v => setSettings(s => ({ ...s, grande: v }))} label="Texto grande" />
+          <Toggle checked={settings.espaciado} onChange={v => setSettings(s => ({ ...s, espaciado: v }))} label="Espaciado entre letras" />
+          <Toggle checked={settings.altoContraste} onChange={v => setSettings(s => ({ ...s, altoContraste: v }))} label="Alto contraste" />
+          <Toggle checked={settings.vozLenta} onChange={v => setSettings(s => ({ ...s, vozLenta: v }))} label="Hablar más lento (TTS)" />
+          <div className="text-sm">
+            <label className="block mb-1">Variante de español para voz</label>
+            <select className="p-3 rounded-2xl border bg-neutral-50 dark:bg-neutral-800" value={settings.varianteES} onChange={e => setSettings(s => ({ ...s, varianteES: e.target.value }))}>
+              <option value="es-ES">Español (España)</option>
+              <option value="es-MX">Español (México)</option>
+              <option value="es-419">Español (Latinoamérica)</option>
+            </select>
+          </div>
+          <div className="pt-2 flex gap-2">
+            <Button onClick={onLogout} className="bg-red-600 text-white">Cerrar sesión</Button>
+            <Button onClick={() => { storage.del("cs.users"); storage.del("cs.session"); location.reload(); }}>Borrar todos los datos</Button>
+          </div>
+          <div className="text-xs text-neutral-500">Consejo: prueba en Chrome o Edge para mejor compatibilidad con voz.</div>
+        </div>
+      </Card>
+    );
+  }
+
+  function Ayuda() {
+    return (
+      <Card title="Cómo usar Clear Speak">
+        <ul className="list-disc pl-6 space-y-1 text-sm">
+          <li>Empieza en <strong>Lectura</strong> para mejorar la decodificación. Pulsa <em>Escuchar</em> y lee en voz alta.</li>
+          <li>En <strong>Pronunciación</strong>, repite la palabra y mira tu <em>precisión</em>. Vuelve a intentar hasta llegar a 90% o más.</li>
+          <li>En <strong>Escritura</strong>, escucha el dictado y escribe. Observa las sílabas como pista.</li>
+          <li>En <strong>Juegos</strong>, practica pares mínimos para distinguir sonidos parecidos.</li>
+          <li>Revisa tu <strong>Progreso</strong> y ajusta accesibilidad en <strong>Ajustes</strong>.</li>
+        </ul>
+      </Card>
+    );
+  }
+
+  // --------- App principal (versión react en navegador) ---------
+  function App() {
+    const [user, setUser] = useState(storage.get("cs.session", null));
+    const [tab, setTab] = useState("inicio");
+    const [settings, setSettings] = useState(storage.get("cs.settings", { grande: true, espaciado: true, altoContraste: false, vozLenta: true, varianteES: "es-419" }));
+
+    useEffect(() => { storage.set("cs.settings", settings); }, [settings]);
+
+    if (!user) return <AuthScreen onLogin={setUser} />;
+
+    function updateProgreso(field) {
+      const users = storage.get("cs.users", []);
+      const updated = users.map(u => u.id === user.id ? { ...u, progreso: { ...u.progreso, [field]: (u.progreso?.[field] || 0) + 1 } } : u);
+      const me = updated.find(u => u.id === user.id);
+      storage.set("cs.users", updated); storage.set("cs.session", me); setUser(me);
+    }
+
+    return (
+      <div className={`${settings.altoContraste ? "bg-white dark:bg-black text-black dark:text-white" : "bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-neutral-900 dark:to-neutral-950 text-neutral-900 dark:text-neutral-100"} min-h-screen`}>
+        <header className="max-w-5xl mx-auto px-4 pt-6 pb-3 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-2xl bg-blue-600 text-white grid place-items-center font-bold">CS</div>
+            <div>
+              <div className="font-extrabold text-xl">Clear Speak</div>
+              <div className="text-xs text-neutral-500">Hola, {user.nombre}</div>
+            </div>
+          </div>
+          <nav className="hidden md:flex gap-2">
+            {[
+              ["inicio","Inicio"], ["lectura","Lectura"], ["pron","Pronunciación"], ["escritura","Escritura"], ["juegos","Juegos"], ["progreso","Progreso"], ["ajustes","Ajustes"],
+            ].map(([id, label]) => (
+              <button key={id} onClick={() => setTab(id)} className={`px-4 py-2 rounded-2xl ${tab===id?"bg-blue-600 text-white":"bg-white/80 dark:bg-neutral-900/80 border"}`}>{label}</button>
+            ))}
+          </nav>
+        </header>
+
+        <main className="max-w-5xl mx-auto px-4 pb-20">
+          <div className="md:hidden grid grid-cols-3 gap-2 mb-4">
+            {[
+              ["inicio","Inicio"], ["lectura","Lectura"], ["pron","Pronunc."], ["escritura","Escritura"], ["juegos","Juegos"], ["progreso","Progreso"], ["ajustes","Ajustes"],
+            ].map(([id, label]) => (
+              <button key={id} onClick={() => setTab(id)} className={`p-2 rounded-2xl ${tab===id?"bg-blue-600 text-white":"bg-white/80 dark:bg-neutral-900/80 border"}`}>{label}</button>
+            ))}
+          </div>
+
+          {tab === "inicio" && (
+            <div className="grid md:grid-cols-2 gap-4">
+              <Card title="Comienza aquí">
+                <p className="text-sm text-neutral-600">Practica 10 minutos al día. Habla despacio. Toma pausas. Repite.</p>
+                <div className="grid grid-cols-2 gap-3 mt-3">
+                  <Stat label="Lectura hoy" value={user.progreso?.lectura || 0} />
+                  <Stat label="Pronunciación hoy" value={user.progreso?.pron || 0} />
+                  <Stat label="Escritura hoy" value={user.progreso?.escritura || 0} />
+                  <Stat label="Juegos hoy" value={user.progreso?.juegos || 0} />
+                </div>
+              </Card>
+              <Ayuda />
+            </div>
+          )}
+
+          {tab === "lectura" && <Lectura onComplete={() => updateProgreso("lectura")} settings={settings} />}
+          {tab === "pron" && <Pronunciacion onComplete={() => updateProgreso("pron")} settings={settings} />}
+          {tab === "escritura" && <Escritura onComplete={() => updateProgreso("escritura")} settings={settings} />}
+          {tab === "juegos" && <Juegos onComplete={() => updateProgreso("juegos")} />}
+          {tab === "progreso" && <Progreso user={user} />}
+          {tab === "ajustes" && <Ajustes settings={settings} setSettings={setSettings} onLogout={() => { storage.del("cs.session"); location.reload(); }} />}
+
+        </main>
+
+        <footer className="max-w-5xl mx-auto px-4 pb-10 text-xs text-neutral-500">
+          <div>© {new Date().getFullYear()} Clear Speak — Prototipo educativo en español. Hecho con ❤️.</div>
+        </footer>
+      </div>
+    );
+  }
+
+  // Montar la app
+  const root = ReactDOM.createRoot(document.getElementById("root"));
+  root.render(<App />);
+
+  </script>
+</body>
+</html>
